@@ -57,12 +57,113 @@ void TopLevelTimeRangeMap(
     }
 }
 
+namespace {
+struct TimelineHit {
+    const TimelineItemLayout* layout;
+    ImRect rect;
+};
+
+ImRect ChildBarRect(
+    const TimelineItemLayout& parent,
+    const ImRect& parent_rect,
+    const TimelineItemLayout& child,
+    float scale) {
+    float x = parent_rect.Min.x
+        + (child.range.start_time() - parent.range.start_time()).to_seconds() * scale;
+    float y = parent_rect.Min.y + child.y;
+    return ImRect(ImVec2(x, y), ImVec2(x + child.range.duration().to_seconds() * scale,
+                                     y + child.height));
+}
+
+ImRect PreviewClipRect(ImRect rect) {
+    float inset = fminf(2.0f, rect.GetWidth() * 0.1f);
+    rect.Min.x += inset;
+    rect.Max.x -= inset;
+    return rect;
+}
+
+TimelineHit HitTestTimelineItem(
+    const TimelineItemLayout& layout, const ImRect& rect,
+    ImRect clip, ImVec2 mouse, float scale) {
+    clip.ClipWith(PreviewClipRect(rect));
+    // Reverse draw order gives the visually topmost bar priority.
+    for (auto it = layout.children.rbegin(); it != layout.children.rend(); ++it) {
+        auto child_rect = ChildBarRect(layout, rect, *it, scale);
+        auto visible = PreviewClipRect(child_rect);
+        visible.ClipWith(clip);
+        if (child_rect.GetWidth() >= 1 && visible.Contains(mouse))
+            return HitTestTimelineItem(*it, child_rect, clip, mouse, scale);
+    }
+    return {&layout, rect};
+}
+
+bool FindTimelineSelection(
+    const TimelineItemLayout& layout, const ImRect& rect,
+    float scale, ImRect& selected_rect) {
+    if (layout.item == appState.selected_object) {
+        selected_rect = rect;
+        return true;
+    }
+    for (const auto& child : layout.children) {
+        if (FindTimelineSelection(child, ChildBarRect(layout, rect, child, scale),
+                                  scale, selected_rect))
+            return true;
+    }
+    return false;
+}
+
+float DisclosureWidth() {
+    return ImGui::GetTextLineHeight();
+}
+
+void DrawTimelineDisclosure(const TimelineItemLayout& layout, const ImRect& rect,
+                            ImU32 color) {
+    if (!layout.expandable || rect.GetWidth() < DisclosureWidth() + 4)
+        return;
+    ImGui::RenderArrow(ImGui::GetWindowDrawList(),
+                       ImVec2(rect.Min.x + 3, rect.Min.y + 3), color,
+                       layout.expanded ? ImGuiDir_Down : ImGuiDir_Right, 0.75f);
+}
+
+void DrawNestedItems(const TimelineItemLayout& parent, const ImRect& parent_rect,
+                     const TimelineItemLayout* hovered, float scale) {
+    auto draw_list = ImGui::GetWindowDrawList();
+    auto clip = PreviewClipRect(parent_rect);
+    ImGui::PushClipRect(clip.Min, clip.Max, true);
+    for (const auto& child : parent.children) {
+        auto rect = ChildBarRect(parent, parent_rect, child, scale);
+        if (rect.GetWidth() < 1 || !ImGui::IsRectVisible(rect.Min, rect.Max))
+            continue;
+        auto bar = PreviewClipRect(rect);
+        ImU32 fill = child.depth % 2 ? IM_COL32(48, 103, 161, 255)
+                                   : IM_COL32(65, 83, 140, 255);
+        if (&child == hovered)
+            fill = LerpColors(fill, IM_COL32_WHITE, 0.18f);
+        bool selected = appState.selected_object == child.item;
+        if (selected)
+            fill = LerpColors(fill, IM_COL32_WHITE, 0.28f);
+        draw_list->AddRectFilled(bar.Min, bar.Max, fill, 3);
+        if (selected)
+            draw_list->AddRect(bar.Min, bar.Max, IM_COL32_WHITE, 3);
+        ImGui::PushClipRect(bar.Min, bar.Max, true);
+        DrawTimelineDisclosure(child, bar, IM_COL32_WHITE);
+        float label_x = bar.Min.x + 4 + (child.expandable ? DisclosureWidth() : 0);
+        draw_list->AddText(ImVec2(label_x, bar.Min.y + 3), IM_COL32_WHITE,
+                           child.item->name().c_str());
+        DrawNestedItems(child, rect, hovered, scale);
+        ImGui::PopClipRect();
+        ++__items_rendered;
+    }
+    ImGui::PopClipRect();
+}
+} // namespace
+
 void DrawItem(
-    otio::Item* item,
+    const TimelineItemLayout& layout,
     float scale,
     ImVec2 origin,
-    float height,
-    std::map<otio::Composable*, otio::TimeRange>& range_map) {
+    float height) {
+    auto item = layout.item;
     auto duration = item->duration();
 
     // If duration is 0, don't draw Item.
@@ -70,7 +171,7 @@ void DrawItem(
         return;
     }
     auto trimmed_range = item->trimmed_range();
-    float width = duration.to_seconds() * scale;
+    float width = layout.range.duration().to_seconds() * scale;
     if (width < 1)
         return;
 
@@ -80,15 +181,10 @@ void DrawItem(
     // is there enough horizontal space for labels at all?
     bool show_label = width > text_offset.x * 2;
     // is there enough vertical *and* horizontal space for time ranges?
-    bool show_time_range = (height > font_height * 2 + text_offset.y * 2)
+    bool show_time_range = (layout.header_height > font_height * 2 + text_offset.y * 2)
         && (width > font_width * 15);
 
-    auto range_it = range_map.find(item);
-    if (range_it == range_map.end()) {
-        Log("Couldn't find %s in range map?!", item->name().c_str());
-        assert(false);
-    }
-    auto item_range = range_it->second;
+    auto item_range = layout.range;
 
     ImVec2 size(width, height);
     ImVec2 render_pos(
@@ -128,19 +224,17 @@ void DrawItem(
     ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton("##Item", size);
 
-    // Don't skip invisible item if it is the item we have just selected
-    if (!ImGui::IsItemVisible() 
-        && appState.selected_object == item
-        && appState.scroll_key) {
-
-        if (appState.scroll_up_down) {
-            ImGui::ScrollToItem(ImGuiScrollFlags_AlwaysCenterY);
-        } else{
-            ImGui::ScrollToItem();
+    ImRect item_rect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    if (appState.scroll_key) {
+        ImRect selected_rect;
+        if (FindTimelineSelection(layout, item_rect, scale, selected_rect)) {
+            auto flags = appState.scroll_up_down ? ImGuiScrollFlags_AlwaysCenterY
+                                               : ImGuiScrollFlags_KeepVisibleEdgeX
+                                                 | ImGuiScrollFlags_KeepVisibleEdgeY;
+            ImGui::ScrollToRect(ImGui::GetCurrentWindow(), selected_rect, flags);
+            appState.scroll_key = false;
+            appState.scroll_up_down = false;
         }
-        
-        appState.scroll_key = false;
-        appState.scroll_up_down = false;
     }
     if (!ImGui::IsItemVisible()) {
         // exit early if this item is off-screen
@@ -159,18 +253,22 @@ void DrawItem(
         return;
     }
 
-    // Dragging...
-    // if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
-    // {
-    //     offset.x += ImGui::GetIO().MouseDelta.x;
-    //     offset.y += ImGui::GetIO().MouseDelta.y;
-    // }
-
-    if (ImGui::IsItemHovered()) {
+    bool hovered = ImGui::IsItemHovered();
+    auto hit = HitTestTimelineItem(layout, item_rect, item_rect,
+                                   ImGui::GetIO().MousePos, scale);
+    if (hovered && hit.layout == &layout)
         fill_color = hover_fill_color;
-    }
     if (ImGui::IsItemClicked()) {
-        SelectObject(item);
+        SelectObject(hit.layout->item);
+        if (hit.layout->expandable) {
+            bool on_arrow = hit.rect.GetWidth() >= DisclosureWidth() + 4
+                && ImGui::GetIO().MousePos.x < hit.rect.Min.x + DisclosureWidth() + 4
+                && ImGui::GetIO().MousePos.y < hit.rect.Min.y + hit.layout->header_height;
+            if (on_arrow || !hit.layout->expanded) {
+                auto composition = static_cast<otio::Composition*>(hit.layout->item);
+                appState.active_tab->timeline_expansion[composition] = !hit.layout->expanded;
+            }
+        }
     }
 
     if (appState.selected_object == item) {
@@ -206,8 +304,11 @@ void DrawItem(
         draw_list->AddRectFilled(p0, p1, fill_color);
     }
 
+    DrawTimelineDisclosure(layout, item_rect, label_color);
     if (show_label) {
-        const ImVec2 text_pos = ImVec2(p0.x + text_offset.x, p0.y + text_offset.y);
+        const ImVec2 text_pos = ImVec2(
+            p0.x + text_offset.x + (layout.expandable ? DisclosureWidth() : 0),
+            p0.y + text_offset.y);
         if (label_str != "") {
             draw_list->AddText(text_pos, label_color, label_str.c_str());
         }
@@ -241,22 +342,22 @@ void DrawItem(
             time_scalar,
             scale,
             width,
-            height - ruler_y_offset);
+            layout.header_height - ruler_y_offset);
     }
 
-    if (ImGui::IsItemHovered()) {
+    DrawNestedItems(layout, item_rect, hovered ? hit.layout : nullptr, scale);
+    if (hovered) {
+        auto hovered_item = hit.layout->item;
+        auto hovered_range = hovered_item->trimmed_range();
         std::string extra;
-        if (const auto& comp = dynamic_cast<otio::Composition*>(item)) {
-            extra = "\nChildren: " + std::to_string(comp->children().size());
-        }
+        if (auto composition = dynamic_cast<otio::Composition*>(hovered_item))
+            extra = "\nChildren: " + std::to_string(composition->children().size());
         ImGui::SetTooltip(
             "%s: %s\nRange: %s - %s\nDuration: %s%s",
-            item->schema_name().c_str(),
-            item->name().c_str(),
-            FormattedStringFromTime(trimmed_range.start_time()).c_str(),
-            FormattedStringFromTime(trimmed_range.end_time_inclusive()).c_str(),
-            FormattedStringFromTime(duration).c_str(),
-            extra.c_str());
+            hovered_item->schema_name().c_str(), hovered_item->name().c_str(),
+            FormattedStringFromTime(hovered_range.start_time()).c_str(),
+            FormattedStringFromTime(hovered_range.end_time_inclusive()).c_str(),
+            FormattedStringFromTime(hovered_range.duration()).c_str(), extra.c_str());
     }
 
     ImGui::PopClipRect();
@@ -753,11 +854,11 @@ void DrawTrackLabel(otio::Track* track, int index, float height) {
 
 void DrawTrack(
     otio::Track* track,
+    const TimelineTrackLayout& layout,
     int index,
     float scale,
     ImVec2 origin,
-    float full_width,
-    float height) {
+    float full_width) {
     ImGui::BeginGroup();
 
     otio::ErrorStatus error_status;
@@ -770,22 +871,19 @@ void DrawTrack(
     }
     TopLevelTimeRangeMap(range_map, track);
 
-    for (const auto& child : track->children()) {
-        if (const auto& item = dynamic_cast<otio::Item*>(child.value)) {
-            DrawItem(item, scale, origin, height, range_map);
-        }
-    }
+    for (const auto& item : layout.items)
+        DrawItem(item, scale, origin, item.height);
 
     for (const auto& child : track->children()) {
         if (const auto& transition = dynamic_cast<otio::Transition*>(child.value)) {
-            DrawTransition(transition, scale, origin, height, range_map);
+            DrawTransition(transition, scale, origin, appState.track_height, range_map);
         }
     }
 
     for (const auto& child : track->children()) {
         if (const auto& item = dynamic_cast<otio::Item*>(child.value)) {
-            DrawEffects(item, scale, origin, height, range_map);
-            DrawMarkers(item, scale, origin, height, range_map);
+            DrawEffects(item, scale, origin, appState.track_height, range_map);
+            DrawMarkers(item, scale, origin, appState.track_height, range_map);
         }
     }
 
@@ -1422,7 +1520,7 @@ void HandleKeyboardNavigation() {
                                     otio::Track* next_track = dynamic_cast<otio::Track*>(next_it);
 
                                     // Only iterate over tracks of the same kind
-                                    if(next_track->kind() != selected_track_type){
+                                    if(!next_track || next_track->kind() != selected_track_type){
                                         break;
                                     }
 
@@ -1566,18 +1664,24 @@ void DrawTimeline(otio::Timeline* timeline) {
         // for (const auto& video_track : video_tracks)
         {
             const auto& video_track = *i;
-            ImGui::TableNextRow(ImGuiTableRowFlags_None, appState.track_height);
+            otio::ErrorStatus layout_error;
+            auto layout = BuildTimelineTrackLayout(
+                video_track, timeline->tracks(), appState.active_tab->timeline_expansion,
+                appState.track_height, ImGui::GetTextLineHeight() + 6, &layout_error);
+            if (otio::is_error(layout_error))
+                ErrorMessage("Error calculating nested timing: %s", otio_error_string(layout_error).c_str());
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, layout.height);
             if (ImGui::TableNextColumn()) {
-                DrawTrackLabel(video_track, index, appState.track_height);
+                DrawTrackLabel(video_track, index, layout.height);
             }
             if (ImGui::TableNextColumn()) {
                 DrawTrack(
                     video_track,
+                    layout,
                     index,
                     appState.active_tab->scale,
                     origin,
-                    full_width,
-                    appState.track_height);
+                    full_width);
             }
             index--;
         }
@@ -1594,18 +1698,24 @@ void DrawTimeline(otio::Timeline* timeline) {
 
         index = 1;
         for (const auto& audio_track : audio_tracks) {
-            ImGui::TableNextRow(ImGuiTableRowFlags_None, appState.track_height);
+            otio::ErrorStatus layout_error;
+            auto layout = BuildTimelineTrackLayout(
+                audio_track, timeline->tracks(), appState.active_tab->timeline_expansion,
+                appState.track_height, ImGui::GetTextLineHeight() + 6, &layout_error);
+            if (otio::is_error(layout_error))
+                ErrorMessage("Error calculating nested timing: %s", otio_error_string(layout_error).c_str());
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, layout.height);
             if (ImGui::TableNextColumn()) {
-                DrawTrackLabel(audio_track, index, appState.track_height);
+                DrawTrackLabel(audio_track, index, layout.height);
             }
             if (ImGui::TableNextColumn()) {
                 DrawTrack(
                     audio_track,
+                    layout,
                     index,
                     appState.active_tab->scale,
                     origin,
-                    full_width,
-                    appState.track_height);
+                    full_width);
             }
             index++;
         }
@@ -1615,18 +1725,24 @@ void DrawTimeline(otio::Timeline* timeline) {
         for (auto i = other_tracks.rbegin(); i != other_tracks.rend(); ++i)
         {
             const auto& other_track = *i;
-            ImGui::TableNextRow(ImGuiTableRowFlags_None, appState.track_height);
+            otio::ErrorStatus layout_error;
+            auto layout = BuildTimelineTrackLayout(
+                other_track, timeline->tracks(), appState.active_tab->timeline_expansion,
+                appState.track_height, ImGui::GetTextLineHeight() + 6, &layout_error);
+            if (otio::is_error(layout_error))
+                ErrorMessage("Error calculating nested timing: %s", otio_error_string(layout_error).c_str());
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, layout.height);
             if (ImGui::TableNextColumn()) {
-                DrawTrackLabel(other_track, index, appState.track_height);
+                DrawTrackLabel(other_track, index, layout.height);
             }
             if (ImGui::TableNextColumn()) {
                 DrawTrack(
                     other_track,
+                    layout,
                     index,
                     appState.active_tab->scale,
                     origin,
-                    full_width,
-                    appState.track_height);
+                    full_width);
             }
             index--;
         }
