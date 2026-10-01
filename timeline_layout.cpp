@@ -24,10 +24,18 @@ struct LayoutBuilder {
     otio::ErrorStatus* error;
 
     TimelineItemLayout Item(
-        otio::Item* item, const otio::TimeRange& range, int depth) {
+        otio::Item* item, const otio::TimeRange& range,
+        const otio::TimeRange& full_range, int depth) {
         TimelineItemLayout result;
         result.item = item;
         result.range = range;
+        // Equivalent to transforming the visible range back into item space,
+        // using the already-calculated placement to avoid walking ancestors per clip.
+        result.source_range = otio::TimeRange(
+            item->trimmed_range(error).start_time() + (range.start_time() - full_range.start_time()),
+            range.duration());
+        if (otio::is_error(error))
+            return result;
         result.depth = depth;
         result.header_height = depth == 0 ? track_height : bar_height;
         result.height = result.header_height;
@@ -63,17 +71,16 @@ struct LayoutBuilder {
             return 0;
         bool parallel = dynamic_cast<otio::Stack*>(composition) != nullptr;
         float height = 0;
-        for (const auto& child : composition->children()) {
-            auto item = dynamic_cast<otio::Item*>(child.value);
+        for (auto child : TimelineChildrenInDisplayOrder(composition)) {
+            auto item = dynamic_cast<otio::Item*>(child);
             if (!item || (depth > 0 && dynamic_cast<otio::Gap*>(item)))
                 continue;
             const auto found = ranges.find(item);
             if (found == ranges.end())
                 continue;
             const auto& local = found->second;
-            auto visible = Intersection(
-                otio::TimeRange(local.start_time() + offset, local.duration()),
-                visible_range);
+            auto full_range = otio::TimeRange(local.start_time() + offset, local.duration());
+            auto visible = Intersection(full_range, visible_range);
             if (!visible)
                 continue;
 
@@ -86,7 +93,7 @@ struct LayoutBuilder {
                 for (size_t i = first; i < items.size(); ++i)
                     items[i].y += y;
             } else {
-                auto layout = Item(item, *visible, depth);
+                auto layout = Item(item, *visible, full_range, depth);
                 layout.y = y;
                 child_height = layout.height;
                 items.push_back(std::move(layout));
@@ -124,4 +131,75 @@ TimelineTrackLayout BuildTimelineTrackLayout(
     if (otio::is_error(error))
         result.items.clear();
     return result;
+}
+
+std::vector<otio::Composable*> TimelineChildrenInDisplayOrder(otio::Composition* composition) {
+    std::vector<otio::Composable*> video, audio, other, items;
+    bool stack = dynamic_cast<otio::Stack*>(composition) != nullptr;
+    for (const auto& child : composition->children()) {
+        auto track = stack ? dynamic_cast<otio::Track*>(child.value) : nullptr;
+        if (!track)
+            items.push_back(child.value);
+        else if (track->kind() == otio::Track::Kind::video)
+            video.push_back(track);
+        else if (track->kind() == otio::Track::Kind::audio)
+            audio.push_back(track);
+        else
+            other.push_back(track);
+    }
+    std::vector<otio::Composable*> result(video.rbegin(), video.rend());
+    result.insert(result.end(), audio.begin(), audio.end());
+    result.insert(result.end(), other.rbegin(), other.rend());
+    result.insert(result.end(), items.begin(), items.end());
+    return result;
+}
+
+otio::TimeRange TimelineRulerRange(const TimelineItemLayout& layout, double time_scalar) {
+    auto source_start = layout.item->trimmed_range().start_time();
+    auto offset = layout.source_range.start_time() - source_start;
+    auto duration = layout.source_range.duration();
+    return otio::TimeRange(
+        source_start + otio::RationalTime(offset.value() * time_scalar, offset.rate()),
+        otio::RationalTime(duration.value() * time_scalar, duration.rate()));
+}
+
+std::optional<otio::TimeRange> VisibleTimelineMarkerRange(
+    const TimelineItemLayout& layout, const otio::TimeRange& marker_range) {
+    auto start = layout.range.start_time()
+        + (marker_range.start_time() - layout.source_range.start_time());
+    if (marker_range.duration().value() == 0) {
+        if (start >= layout.range.start_time() && start < layout.range.end_time_exclusive())
+            return otio::TimeRange(start, marker_range.duration());
+        return std::nullopt;
+    }
+    return Intersection(otio::TimeRange(start, marker_range.duration()), layout.range);
+}
+
+otio::Composable* TimelineVerticalNeighbor(
+    otio::Composable* selected, bool above, otio::ErrorStatus* error_status) {
+    auto current = selected ? dynamic_cast<otio::Track*>(selected->parent()) : nullptr;
+    auto stack = current ? dynamic_cast<otio::Stack*>(current->parent()) : nullptr;
+    if (!stack)
+        return nullptr;
+    std::vector<otio::Track*> siblings;
+    for (auto child : TimelineChildrenInDisplayOrder(stack)) {
+        auto track = dynamic_cast<otio::Track*>(child);
+        if (track && track->kind() == current->kind())
+            siblings.push_back(track);
+    }
+    auto it = std::find(siblings.begin(), siblings.end(), current);
+    if (it == siblings.end() || (above && it == siblings.begin())
+        || (!above && std::next(it) == siblings.end()))
+        return nullptr;
+    auto next = above ? *std::prev(it) : *std::next(it);
+    auto range = current->trimmed_range_of_child(selected, error_status);
+    if (!range || otio::is_error(error_status))
+        return nullptr;
+    auto time = current->transformed_time(range->start_time(), next, error_status);
+    if (otio::is_error(error_status))
+        return nullptr;
+    auto next_range = next->trimmed_range(error_status);
+    if (otio::is_error(error_status) || !next_range.contains(time))
+        return nullptr;
+    return next->child_at_time(time, error_status);
 }

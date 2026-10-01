@@ -170,7 +170,6 @@ void DrawItem(
     if (duration.to_seconds() <= 0) {
         return;
     }
-    auto trimmed_range = item->trimmed_range();
     float width = layout.range.duration().to_seconds() * scale;
     if (width < 1)
         return;
@@ -314,22 +313,10 @@ void DrawItem(
         }
     }
     if (show_time_range) {
-        // auto str1 = std::to_string(trimmed_range.start_time().to_frames());
-        // auto str2 =
-        // std::to_string(trimmed_range.end_time_inclusive().to_frames()); auto pos1
-        // = ImVec2(p0.x + text_offset.x, p1.y - text_offset.y - font_height); auto
-        // pos2 = ImVec2(p1.x - text_offset.x - ImGui::CalcTextSize(str2.c_str()).x,
-        // p1.y - text_offset.y - font_height); draw_list->AddText(pos1,
-        // label_color, str1.c_str()); draw_list->AddText(pos2, label_color,
-        // str2.c_str());
         auto time_scalar = TimeScalarForItem(item);
-        auto trimmed_range = item->trimmed_range();
-        auto start = trimmed_range.start_time();
-        auto duration = trimmed_range.duration();
-        auto end = start
-            + otio::RationalTime(
-                duration.value() * time_scalar,
-                duration.rate());
+        auto ruler_range = TimelineRulerRange(layout, time_scalar);
+        auto start = ruler_range.start_time();
+        auto end = ruler_range.end_time_exclusive();
         auto rate = start.rate();
         float ruler_y_offset = font_height + text_offset.y;
         ImGui::SetCursorPos(
@@ -482,16 +469,16 @@ void DrawTransition(
 }
 
 void DrawEffects(
-    otio::Item* item,
+    const TimelineItemLayout& layout,
     float scale,
     ImVec2 origin,
-    float row_height,
-    std::map<otio::Composable*, otio::TimeRange>& range_map) {
+    float row_height) {
+    auto item = layout.item;
     auto effects = item->effects();
     if (effects.size() == 0)
         return;
 
-    auto item_duration = item->duration();
+    auto item_duration = layout.range.duration();
     // If duration is 0, don't draw Effect.
     if (item_duration.to_seconds() <= 0) {
         return;
@@ -511,12 +498,7 @@ void DrawEffects(
     float width = fminf(item_width, text_size.x + text_offset.x * 2);
     float height = fminf(row_height - 2, text_size.y + text_offset.y * 2);
 
-    auto range_it = range_map.find(item);
-    if (range_it == range_map.end()) {
-        Log("Couldn't find %s in range map?!", item->name().c_str());
-        assert(false);
-    }
-    auto item_range = range_it->second;
+    auto item_range = layout.range;
 
     ImVec2 size(width, height*0.75);
 
@@ -617,7 +599,8 @@ void DrawMarkers(
     float scale,
     ImVec2 origin,
     float height,
-    std::map<otio::Composable*, otio::TimeRange>& range_map) {
+    std::map<otio::Composable*, otio::TimeRange>& range_map,
+    const TimelineItemLayout* layout = nullptr) {
     auto markers = item->markers();
     if (markers.size() == 0)
         return;
@@ -637,16 +620,22 @@ void DrawMarkers(
     for (const auto& marker : markers) {
         auto range = marker->marked_range();
         auto duration = range.duration();
-        auto start = range.start_time();
+        auto start = item_start_in_parent + (range.start_time() - item_trimmed_start);
+        auto visible_duration = duration;
+        if (layout) {
+            auto visible = VisibleTimelineMarkerRange(*layout, range);
+            if (!visible)
+                continue;
+            start = visible->start_time();
+            visible_duration = visible->duration();
+        }
 
         const float arrow_width = height / 4;
-        float width = duration.to_seconds() * scale + arrow_width;
+        float width = visible_duration.to_seconds() * scale + arrow_width;
 
         ImVec2 size(width, arrow_width);
         ImVec2 render_pos(
-            (item_start_in_parent + (start - item_trimmed_start)).to_seconds()
-                    * scale
-                + origin.x - arrow_width / 2,
+            start.to_seconds() * scale + origin.x - arrow_width / 2,
             ImGui::GetCursorPosY());
 
         auto fill_color = UIColorFromName(marker->color());
@@ -656,7 +645,7 @@ void DrawMarkers(
         auto old_pos = ImGui::GetCursorPos();
         ImGui::SetCursorPos(render_pos);
 
-        ImGui::PushID(item);
+        ImGui::PushID(marker.value);
         ImGui::BeginGroup();
 
         ImGui::InvisibleButton("##Marker", size);
@@ -880,11 +869,20 @@ void DrawTrack(
         }
     }
 
-    for (const auto& child : track->children()) {
-        if (const auto& item = dynamic_cast<otio::Item*>(child.value)) {
-            DrawEffects(item, scale, origin, appState.track_height, range_map);
-            DrawMarkers(item, scale, origin, appState.track_height, range_map);
-        }
+    for (const auto& item : layout.items) {
+        float width = item.range.duration().to_seconds() * scale;
+        if (width < 1)
+            continue;
+        // Clip both rendering and mouse hit tests to the visible header.
+        auto cursor = ImGui::GetCursorPos();
+        auto screen = ImGui::GetCursorScreenPos();
+        ImVec2 p0(screen.x - cursor.x + origin.x + item.range.start_time().to_seconds() * scale,
+                  screen.y);
+        ImVec2 p1(p0.x + width, p0.y + item.header_height);
+        ImGui::PushClipRect(p0, p1, true);
+        DrawEffects(item, scale, origin, item.header_height);
+        DrawMarkers(item.item, scale, origin, item.header_height, range_map, &item);
+        ImGui::PopClipRect();
     }
 
     ImGui::EndGroup();
@@ -1471,74 +1469,17 @@ void HandleKeyboardNavigation() {
             }
         }
 
-        // The Stacks of video and audio Tracks go in opposite directions
-        // therefore the logic for the for the Up Arrow on Video tracks is
-        // the same as the logic for Down Arrow on Audio tracks and vice versa
-        if (selected_item && selected_item->parent()){
-            auto parent = selected_item->parent();
-            auto selected_track = dynamic_cast<otio::Track*>(parent);
-            if (selected_track){
-                std::string selected_track_type = selected_track->kind();
-
-                if ((ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_DownArrow)) ||
-                    (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_UpArrow))) {
-                    // Only run if the right type is selected
-                    std::string selected_type = appState.selected_object->schema_name();
-                    if (selected_type == "Clip" || selected_type == "Gap" || selected_type == "Transition") {
-                        otio::RationalTime start_time = parent->range_of_child(selected_item).start_time();
-                        auto tracks = dynamic_cast<otio::Stack*>(parent->parent());
-
-                        if (tracks){
-                            // Loop through tracks until we find the current one
-                            for(auto it = tracks->children().begin(); it != tracks->children().end(); it++ ){
-                                otio::Composable* track = *it;
-                                if (track == parent) {
-                                    // Down Arrow and Video or Up Arrow and Audio
-                                    if ((ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_DownArrow) && selected_track_type == "Video") ||
-                                        (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_UpArrow) && selected_track_type == "Audio")) {
-                                        // If first item then do nothing
-                                        if (it == tracks->children().begin()) {
-                                            break;
-                                        }
-                                        // Select the next track up
-                                        std::advance(it, -1);
-
-                                    // Up Arrow and Video or Down Arrow and Audio
-                                    } else if ((ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_UpArrow) && selected_track_type == "Video") ||
-                                            (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_DownArrow) && selected_track_type == "Audio")) {
-                                        // If last item then do nothing
-                                        if (std::next(it) == tracks->children().end()) {
-                                            break;
-                                        }
-                                        // Select the next track up
-                                        std::advance(it, 1);
-                                    } else{
-                                        break;
-                                    }
-
-                                    otio::Composable* next_it = *it;
-                                    otio::Track* next_track = dynamic_cast<otio::Track*>(next_it);
-
-                                    // Only iterate over tracks of the same kind
-                                    if(!next_track || next_track->kind() != selected_track_type){
-                                        break;
-                                    }
-
-                                    // If there is an iten that overlaps with the current selection's start time
-                                    // select it
-                                    // TODO: Moving up and down jumps to the start of the clip which is not ideal.
-                                    //       Maybe find the clip with the largest overlap, then fall bag to an overlapping gap
-                                    if (next_track->child_at_time(start_time)){
-                                        SelectObject(next_track->child_at_time(start_time));
-                                        if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_DownArrow)) appState.scroll_key = true;
-                                        if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_UpArrow)) appState.scroll_key = true;
-                                        appState.scroll_up_down = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
+        bool up = ImGui::IsKeyPressed(ImGuiKey_UpArrow);
+        bool down = ImGui::IsKeyPressed(ImGuiKey_DownArrow);
+        if (selected_item && (up || down)) {
+            auto type = selected_item->schema_name();
+            if (type == "Clip" || type == "Gap" || type == "Transition") {
+                otio::ErrorStatus error;
+                auto neighbor = TimelineVerticalNeighbor(selected_item, up, &error);
+                if (neighbor && !otio::is_error(error)) {
+                    SelectObject(neighbor);
+                    appState.scroll_key = true;
+                    appState.scroll_up_down = true;
                 }
             }
         }

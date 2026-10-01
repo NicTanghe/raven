@@ -93,18 +93,19 @@ static void DeepAndParallel() {
     auto closed = f.Layout();
     auto& outer_bar = closed.items[0];
     Check(outer_bar.children.size() == 2, "Wrapping tracks must become lanes");
-    Check(!outer_bar.children[0].expanded && outer_bar.children[0].children.empty(),
+    Check(outer_bar.children[0].item->name() == "Parallel", "Higher video tracks must appear first");
+    Check(!outer_bar.children[1].expanded && outer_bar.children[1].children.empty(),
           "Deeper stacks should start collapsed");
     Check(outer_bar.children[1].y >= outer_bar.children[0].y + outer_bar.children[0].height,
           "Parallel lanes overlap");
     f.expansion[inner] = true;
     auto expanded = f.Layout();
-    const auto& expanded_inner = expanded.items[0].children[0];
+    const auto& expanded_inner = expanded.items[0].children[1];
     Check(expanded_inner.children.size() == 2, "Expanding must reveal immediate children");
     CheckRange(expanded_inner.children[1], 2, 2);
     Check(expanded.height > closed.height, "Expanding must grow the track row");
-    Check(expanded.items[0].children[1].y >= expanded_inner.y + expanded_inner.height,
-          "Expanding must move the next lane down");
+    Check(expanded_inner.y >= expanded.items[0].children[0].y + expanded.items[0].children[0].height,
+          "Expanded lanes must not overlap");
     Fixture other_tab;
     Check(other_tab.expansion.empty(), "Expansion must be local to a tab");
 }
@@ -124,6 +125,8 @@ static void TrimsGapsAndRates() {
     CheckRange(bar, 3, 3);
     Check(bar.children.size() == 2, "Trimmed-out clips and nested gaps should be omitted");
     CheckRange(bar.children[0], 3, 1);
+    Check(bar.children[0].source_range.start_time().to_seconds() == 101,
+          "Nested source ranges must include every ancestor trim");
     CheckRange(bar.children[1], 5, 1);
     Check(bar.children[0].item->name() == "A", "Wrong clip after ancestor trims");
     f.main->set_source_range(Range(4, 1));
@@ -150,6 +153,68 @@ static void EmptyAndTransitions() {
     Check(f.Layout().height == 30, "Collapsing should restore normal track height");
 }
 
+static void ClippedRulersAndMarkers() {
+    Fixture f;
+    auto clip = Clip("Source 100", 10);
+    f.main->append_child(clip);
+    f.main->set_source_range(Range(5, 3));
+    auto bar = f.Layout().items[0];
+    auto ruler = TimelineRulerRange(bar, 1);
+    Check(ruler.start_time() == Range(105, 3).start_time(), "Clipped ruler must begin at source 105");
+    Check(ruler.duration() == Range(105, 3).duration(), "Ruler must use visible duration");
+    ruler = TimelineRulerRange(bar, 2);
+    Check(ruler.start_time() == Range(110, 6).start_time(), "Apply time scaling to clipped source offset");
+    Check(ruler.duration() == Range(110, 6).duration(), "Apply time scaling to visible duration");
+    Check(!VisibleTimelineMarkerRange(bar, Range(100, 2)), "Hide markers before the visible bar");
+    Check(!VisibleTimelineMarkerRange(bar, Range(108, 1)), "Hide markers after the visible bar");
+    auto spanning = VisibleTimelineMarkerRange(bar, Range(104, 3));
+    Check(spanning && spanning->start_time().to_seconds() == 0
+          && spanning->duration().to_seconds() == 2, "Clip overlapping marker without shifting it");
+    auto tail = VisibleTimelineMarkerRange(bar, Range(107, 3));
+    Check(tail && tail->start_time().to_seconds() == 2
+          && tail->duration().to_seconds() == 1, "Clip marker at the right edge");
+    Check(VisibleTimelineMarkerRange(bar, Range(105, 0)).has_value(), "Point marker at the left edge is visible");
+    Check(!VisibleTimelineMarkerRange(bar, Range(108, 0)), "Point marker at the exclusive right edge is hidden");
+    Check(!VisibleTimelineMarkerRange(bar, Range(104, 0)), "Point marker outside the bar is hidden");
+}
+
+static void LaneOrderingAndNavigation() {
+    Fixture f;
+    auto stack = new otio::Stack;
+    auto make_track = [](const char* name, const char* kind) {
+        auto track = new otio::Track(name, std::nullopt, kind);
+        track->append_child(Clip(name, 4));
+        return track;
+    };
+    auto v1 = make_track("V1", "Video");
+    auto v2 = make_track("V2", "Video");
+    auto a1 = make_track("A1", "Audio");
+    auto a2 = make_track("A2", "Audio");
+    auto other1 = make_track("Other1", "Custom");
+    auto other2 = make_track("Other2", "Custom");
+    auto direct = Clip("Direct", 4);
+    stack->set_children({v1, a1, other1, direct, v2, a2, other2});
+    f.main->append_child(stack);
+    auto order = TimelineChildrenInDisplayOrder(stack);
+    Check(order == std::vector<otio::Composable*>({v2, v1, a1, a2, other2, other1, direct}),
+          "Nested lane ordering must match the main timeline");
+    auto bars = f.Layout().items[0].children;
+    for (size_t i = 1; i < bars.size(); ++i)
+        Check(bars[i].y >= bars[i-1].y + bars[i-1].height, "Displayed lanes must not overlap");
+    auto child = [](otio::Track* track) { return track->children()[0].value; };
+    otio::ErrorStatus error;
+    Check(TimelineVerticalNeighbor(child(v1), true, &error) == child(v2), "Up must select the video lane above");
+    Check(TimelineVerticalNeighbor(child(v2), false, &error) == child(v1), "Down must select the video lane below");
+    Check(!TimelineVerticalNeighbor(child(v2), true, &error), "Up at the top stays put");
+    Check(!TimelineVerticalNeighbor(child(v1), false, &error), "Video navigation must not enter audio lanes");
+    Check(TimelineVerticalNeighbor(child(a1), false, &error) == child(a2), "Audio Down must follow visual order");
+    Check(TimelineVerticalNeighbor(child(a2), true, &error) == child(a1), "Audio Up must follow visual order");
+    Check(!TimelineVerticalNeighbor(child(a1), true, &error), "Audio navigation must not enter video lanes");
+    Check(!TimelineVerticalNeighbor(child(a2), false, &error), "Down at the bottom stays put");
+    Check(TimelineVerticalNeighbor(child(other1), true, &error) == child(other2), "Other tracks follow reverse order");
+    Check(!otio::is_error(error), "Navigation reported an OTIO error");
+}
+
 static void SuppliedFixture(const char* filename) {
     otio::ErrorStatus error;
     otio::SerializableObject::Retainer<otio::SerializableObject> object(
@@ -168,6 +233,8 @@ int main(int argc, char** argv) {
     DeepAndParallel();
     TrimsGapsAndRates();
     EmptyAndTransitions();
+    ClippedRulersAndMarkers();
+    LaneOrderingAndNavigation();
     if (argc > 1)
         SuppliedFixture(argv[1]);
     std::cout << "Nested timeline layout tests passed\n";

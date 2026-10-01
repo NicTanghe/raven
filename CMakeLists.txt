@@ -172,3 +172,15 @@ if(RAVEN_BUILD_TESTS)
   target_link_libraries(raven_timeline_layout_tests PRIVATE OTIO::opentimelineio)
   add_test(NAME raven_timeline_layout COMMAND raven_timeline_layout_tests)
 endif()
+
+if(RAVEN_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_executable(raven_timeline_ui_tests
+    tests/timeline_ui_test.cpp app.cpp editing.cpp inspector.cpp
+    timeline.cpp timeline_layout.cpp colors.cpp widgets.cpp)
+  target_compile_features(raven_timeline_ui_tests PRIVATE cxx_std_17)
+  target_include_directories(raven_timeline_ui_tests PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_definitions(raven_timeline_ui_tests PRIVATE
+    $<TARGET_PROPERTY:raven,COMPILE_DEFINITIONS>)
+  target_link_libraries(raven_timeline_ui_tests PRIVATE $<TARGET_PROPERTY:raven,LINK_LIBRARIES>)
+  add_test(NAME raven_timeline_ui COMMAND raven_timeline_ui_tests)
+endif()
