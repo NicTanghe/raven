@@ -10,6 +10,8 @@ namespace otio = opentimelineio::OPENTIMELINEIO_VERSION;
 using TimelineExpansion = std::map<const otio::Composition*, bool>;
 
 struct TimelineItemLayout {
+    // Retain the item until this layout (and any copies) has been released.
+    otio::SerializableObject::Retainer<otio::Item> retained_item;
     otio::Item* item = nullptr;
     otio::TimeRange range; // Visible range in top-level timeline coordinates.
     otio::TimeRange source_range; // Visible range in the item's source coordinates.

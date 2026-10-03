@@ -140,8 +140,15 @@ static void NestedNavigation() {
     Check(layout.items[0].children[0].expanded, "Deeper stack should expand on click");
     const auto& lanes = layout.items[0].children[0].children;
     Check(lanes.size() == 2 && lanes[0].item == upper_clip, "Upper video lane must be displayed first");
-    Click(150, deep_y + lanes[1].y + 8);
+    const float lower_y = deep_y + lanes[1].y + 8;
+    Click(150, lower_y);
     Check(appState.selected_object == lower_clip, "Nested clip click should select the lower lane");
+    // Both ends must remain selectable inside the former two-pixel inset,
+    // including through multiple ancestors with the same time boundaries.
+    Click(100.5f, lower_y);
+    Check(appState.selected_object == lower_clip, "Nested left edge must use the exact time bounds");
+    Click(299.5f, lower_y);
+    Check(appState.selected_object == lower_clip, "Nested right edge must use the exact time bounds");
     Key(ImGuiKey_UpArrow);
     Check(appState.selected_object == upper_clip, "Up must select the visibly higher clip");
     Key(ImGuiKey_UpArrow);

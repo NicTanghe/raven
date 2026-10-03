@@ -75,21 +75,14 @@ ImRect ChildBarRect(
                                      y + child.height));
 }
 
-ImRect PreviewClipRect(ImRect rect) {
-    float inset = fminf(2.0f, rect.GetWidth() * 0.1f);
-    rect.Min.x += inset;
-    rect.Max.x -= inset;
-    return rect;
-}
-
 TimelineHit HitTestTimelineItem(
     const TimelineItemLayout& layout, const ImRect& rect,
     ImRect clip, ImVec2 mouse, float scale) {
-    clip.ClipWith(PreviewClipRect(rect));
+    clip.ClipWith(rect);
     // Reverse draw order gives the visually topmost bar priority.
     for (auto it = layout.children.rbegin(); it != layout.children.rend(); ++it) {
         auto child_rect = ChildBarRect(layout, rect, *it, scale);
-        auto visible = PreviewClipRect(child_rect);
+        auto visible = child_rect;
         visible.ClipWith(clip);
         if (child_rect.GetWidth() >= 1 && visible.Contains(mouse))
             return HitTestTimelineItem(*it, child_rect, clip, mouse, scale);
@@ -128,13 +121,14 @@ void DrawTimelineDisclosure(const TimelineItemLayout& layout, const ImRect& rect
 void DrawNestedItems(const TimelineItemLayout& parent, const ImRect& parent_rect,
                      const TimelineItemLayout* hovered, float scale) {
     auto draw_list = ImGui::GetWindowDrawList();
-    auto clip = PreviewClipRect(parent_rect);
-    ImGui::PushClipRect(clip.Min, clip.Max, true);
+    // Clip against the true time bounds; horizontal insets would create dead
+    // zones for the playhead and mouse at clip boundaries.
+    ImGui::PushClipRect(parent_rect.Min, parent_rect.Max, true);
     for (const auto& child : parent.children) {
         auto rect = ChildBarRect(parent, parent_rect, child, scale);
         if (rect.GetWidth() < 1 || !ImGui::IsRectVisible(rect.Min, rect.Max))
             continue;
-        auto bar = PreviewClipRect(rect);
+        auto bar = rect;
         ImU32 fill = child.depth % 2 ? IM_COL32(48, 103, 161, 255)
                                    : IM_COL32(65, 83, 140, 255);
         if (&child == hovered)

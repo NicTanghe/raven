@@ -302,6 +302,34 @@ static void SuppliedFixture(const char* filename) {
     Check(layout.items[0].children[0].item->markers().size() == 1, "Fixture marker was lost");
 }
 
+class LifetimeClip : public otio::Clip {
+public:
+    explicit LifetimeClip(bool& destroyed)
+        : otio::Clip("Retained shot", nullptr, Range(0, 2)), destroyed(destroyed) {}
+    ~LifetimeClip() override { destroyed = true; }
+private:
+    bool& destroyed;
+};
+
+static void LayoutLifetime() {
+    bool destroyed = false;
+    TimelineTrackLayout layout;
+    {
+        Fixture f;
+        f.Stack("Parent", {new LifetimeClip(destroyed)});
+        layout = f.Layout();
+        f.main->clear_children();
+    }
+    Check(!destroyed, "Layout must retain items after their document is released");
+    Check(layout.items[0].children[0].item->name() == "Retained shot",
+          "Retained layout item must remain readable");
+    auto copy = layout;
+    layout = {};
+    Check(!destroyed, "Copied layouts must retain their items");
+    copy = {};
+    Check(destroyed, "Last layout release must destroy the retained clip");
+}
+
 int main(int argc, char** argv) {
     BasicAndExpansion();
     DeepAndParallel();
@@ -311,6 +339,7 @@ int main(int argc, char** argv) {
     LaneOrderingAndNavigation();
     SequentialStackLayoutCost();
     HorizontalVisibility();
+    LayoutLifetime();
     if (argc > 1)
         SuppliedFixture(argv[1]);
     std::cout << "Nested timeline layout tests passed\n";

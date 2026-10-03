@@ -26,6 +26,7 @@ struct LayoutBuilder {
         otio::Item* item, const otio::TimeRange& range,
         const otio::TimeRange& full_range, int depth) {
         TimelineItemLayout result;
+        result.retained_item = item;
         result.item = item;
         result.range = range;
         // Equivalent to transforming the visible range back into item space,
