@@ -108,6 +108,14 @@ static void Decorations() {
     Check(appState.selected_object == visible, "Hidden decorations must not accept clicks outside the bar");
     Click(200, 222);
     Check(appState.selected_object == root_marker, "Timeline-level markers must remain selectable");
+    SelectObject(visible);
+    appState.scroll_key = false;
+    Key(ImGuiKey_RightArrow);
+    Check(appState.selected_object == visible && !appState.scroll_key,
+          "Right from the only visible clip must not select hidden children or leave a pending scroll");
+    Key(ImGuiKey_LeftArrow);
+    Check(appState.selected_object == visible && !appState.scroll_key,
+          "Left from the only visible clip must stay selected without requesting a scroll");
 }
 
 static void NestedNavigation() {
@@ -146,6 +154,37 @@ static void NestedNavigation() {
     Check(layout.items[0].children[0].children.empty(), "Deeper stack must still collapse");
 }
 
+static void TrimmedHorizontalNavigation() {
+    timeline = new otio::Timeline;
+    track = new otio::Track("Main");
+    timeline->tracks()->append_child(track);
+    auto stack = new otio::Stack("Trimmed parent", Range(3, 4));
+    auto lane = new otio::Track;
+    auto before = new otio::Clip("Hidden before", nullptr, Range(0, 2));
+    auto first = new otio::Clip("First visible", nullptr, Range(0, 2));
+    auto middle = new otio::Clip("Middle", nullptr, Range(0, 2));
+    auto last = new otio::Clip("Last visible", nullptr, Range(0, 2));
+    auto after = new otio::Clip("Hidden after", nullptr, Range(0, 2));
+    lane->set_children({before, first, middle, last, after});
+    stack->append_child(lane); track->append_child(stack);
+    LoadRoot(timeline);
+    appState.track_height = 30;
+    Frame(); Frame();
+    Check(layout.items[0].children.size() == 3, "Ancestor trim must leave three visible bars");
+    Click(150, 70 + layout.items[0].children[0].y + 8);
+    Check(appState.selected_object == first, "Partially visible first clip should be selectable");
+    Key(ImGuiKey_LeftArrow);
+    Check(appState.selected_object == first && !appState.scroll_key, "Left boundary should preserve the highlight");
+    Key(ImGuiKey_RightArrow);
+    Check(appState.selected_object == middle && !appState.scroll_key, "Right should navigate and finish scrolling");
+    Key(ImGuiKey_RightArrow);
+    Check(appState.selected_object == last && !appState.scroll_key, "Partially visible last clip remains reachable");
+    Key(ImGuiKey_RightArrow);
+    Check(appState.selected_object == last && !appState.scroll_key, "Right boundary should preserve the highlight");
+    Key(ImGuiKey_LeftArrow);
+    Check(appState.selected_object == middle && !appState.scroll_key, "Left should navigate back within visible bars");
+}
+
 int main() {
     ImGui::CreateContext();
     auto& io = ImGui::GetIO();
@@ -159,6 +198,7 @@ int main() {
     io.Fonts->GetTexDataAsRGBA32(&atlas, &width, &height);
     Decorations();
     NestedNavigation();
+    TrimmedHorizontalNavigation();
     MainCleanup();
     ImGui::DestroyContext();
     std::cout << "Timeline UI regression tests passed\n";

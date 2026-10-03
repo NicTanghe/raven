@@ -215,6 +215,80 @@ static void LaneOrderingAndNavigation() {
     Check(!otio::is_error(error), "Navigation reported an OTIO error");
 }
 
+// Count sibling visits rather than asserting wall-clock times in CI.
+class CountingTrack : public otio::Track {
+public:
+    mutable size_t sibling_visits = 0;
+    otio::TimeRange range_of_child_at_index(int index, otio::ErrorStatus* error) const override {
+        sibling_visits += static_cast<size_t>(index + 1);
+        return otio::Track::range_of_child_at_index(index, error);
+    }
+};
+
+static void SequentialStackLayoutCost() {
+    for (int count : {128, 256}) {
+        Fixture f;
+        auto counted = new CountingTrack;
+        f.timeline->tracks()->set_children({counted});
+        f.main = counted;
+        for (int i = 0; i < count; ++i)
+            f.Stack("Nested", {Clip("Shot")});
+        counted->sibling_visits = 0;
+        auto layout = f.Layout();
+        Check(layout.items.size() == static_cast<size_t>(count), "All sequential stacks must be laid out");
+        CheckRange(layout.items.back().children[0], (count - 1) * 2, 2);
+        Check(counted->sibling_visits <= static_cast<size_t>(count * 2),
+              "Layout must not repeatedly scan preceding siblings for expanded stacks");
+    }
+}
+
+static void HorizontalVisibility() {
+    Fixture f;
+    auto before = Clip("Hidden before");
+    auto first = Clip("First visible");
+    auto zero = Clip("Zero", 0);
+    auto middle = Clip("Middle");
+    auto last = Clip("Last visible");
+    auto after = Clip("Hidden after");
+    f.main->set_children({before, first, zero, middle, last, after});
+    f.main->set_source_range(Range(3, 4));
+    otio::ErrorStatus error;
+    Check(!TimelineHorizontalNeighbor(first, true, &error), "Left must stop at the visible boundary");
+    Check(!TimelineHorizontalNeighbor(last, false, &error), "Right must stop at the visible boundary");
+    Check(TimelineHorizontalNeighbor(first, false, &error) == middle, "Right must skip zero-duration children");
+    Check(TimelineHorizontalNeighbor(middle, true, &error) == first, "Partially visible leading clip remains reachable");
+    Check(TimelineHorizontalNeighbor(middle, false, &error) == last, "Partially visible trailing clip remains reachable");
+    Check(TimelineHorizontalNeighbor(last, true, &error) == middle, "Left should select the previous visible clip");
+
+    Fixture nested;
+    auto head = Clip("Hidden head");
+    auto a = Clip("A");
+    auto gap = new otio::Gap(Range(0, 1));
+    auto b = Clip("B");
+    auto tail = Clip("Hidden tail");
+    auto stack = nested.Stack("Trimmed stack", {head, a, gap, b, tail});
+    auto lane = static_cast<otio::Track*>(stack->children()[0].value);
+    lane->set_source_range(Range(1, 8));
+    stack->set_source_range(Range(1.5, 3.5));
+    nested.main->set_source_range(Range(0.5, 2.5));
+    Check(!TimelineHorizontalNeighbor(a, true, &error), "Ancestor trims must hide the nested leading clip");
+    Check(!TimelineHorizontalNeighbor(b, false, &error), "Ancestor trims must hide the nested trailing clip");
+    Check(TimelineHorizontalNeighbor(a, false, &error) == b, "Nested gaps have no bar and must be skipped");
+    Check(TimelineHorizontalNeighbor(b, true, &error) == a, "Left must skip nested gaps too");
+
+    Fixture regular;
+    auto left = Clip("Left");
+    auto right = Clip("Right");
+    auto visible_gap = new otio::Gap(Range(0, 1));
+    auto transition = new otio::Transition("Dissolve", otio::Transition::Type::SMPTE_Dissolve,
+        otio::RationalTime(12, 24), otio::RationalTime(12, 24));
+    regular.main->set_children({left, visible_gap, transition, right});
+    Check(TimelineHorizontalNeighbor(left, false, &error) == visible_gap, "Top-level gaps remain selectable");
+    Check(TimelineHorizontalNeighbor(visible_gap, false, &error) == transition, "Top-level transitions remain selectable");
+    Check(TimelineHorizontalNeighbor(transition, false, &error) == right, "Navigate onward from a transition");
+    Check(!otio::is_error(error), "Horizontal navigation reported an OTIO error");
+}
+
 static void SuppliedFixture(const char* filename) {
     otio::ErrorStatus error;
     otio::SerializableObject::Retainer<otio::SerializableObject> object(
@@ -235,6 +309,8 @@ int main(int argc, char** argv) {
     EmptyAndTransitions();
     ClippedRulersAndMarkers();
     LaneOrderingAndNavigation();
+    SequentialStackLayoutCost();
+    HorizontalVisibility();
     if (argc > 1)
         SuppliedFixture(argv[1]);
     std::cout << "Nested timeline layout tests passed\n";

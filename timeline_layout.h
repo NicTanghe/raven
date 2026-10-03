@@ -48,3 +48,7 @@ std::optional<otio::TimeRange> VisibleTimelineMarkerRange(
 
 otio::Composable* TimelineVerticalNeighbor(
     otio::Composable* selected, bool above, otio::ErrorStatus* error_status);
+
+// Skip children hidden by ancestor trims, but keep offscreen items reachable.
+otio::Composable* TimelineHorizontalNeighbor(
+    otio::Composable* selected, bool before, otio::ErrorStatus* error_status);

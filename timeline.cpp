@@ -1420,52 +1420,18 @@ void DrawTrackSplitter(const char* str_id, float splitter_size) {
 }
 
 void HandleKeyboardNavigation() {
-    // selected_item is used by both left and right key logic
     auto selected_item = dynamic_cast<otio::Composable*>(appState.selected_object);
 
-    if (ImGui::IsWindowFocused()){
-
-        // Right arrow
-        if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_RightArrow)) {
-            if (selected_item) {
-                // Loop through selected items parent track to find the next item
-                auto parent = selected_item->parent();
-                if (parent && parent->schema_name() == "Track"){
-                    for(auto it = parent->children().begin(); it != parent->children().end(); it++ ){
-                        // If last item then do nothing
-                        if (std::next(it) == parent->children().end()) {
-                            break;
-                        }
-                        if (*it == appState.selected_object) {
-                            std::advance(it, 1);
-                            SelectObject(*it);
-                            appState.scroll_key = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Left Arrow
-        if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_LeftArrow)) {
-            if (selected_item){
-                // Loop through selected items parent track to find the previous item
-                auto parent = selected_item->parent();
-                if (parent && parent->schema_name() =="Track"){
-                    for(auto it = parent->children().begin(); it != parent->children().end(); it++ ){
-                        if (*it == appState.selected_object) {
-                            // If first item do nothing
-                            if (it == parent->children().begin()) {
-                                break;
-                            }
-                            std::advance(it, -1);
-                            SelectObject(*it);
-                            appState.scroll_key = true;
-                            break;
-                        }
-                    }
-                }
+    if (ImGui::IsWindowFocused()) {
+        bool left = ImGui::IsKeyPressed(ImGuiKey_LeftArrow);
+        bool right = ImGui::IsKeyPressed(ImGuiKey_RightArrow);
+        if (selected_item && (left || right)) {
+            otio::ErrorStatus error;
+            auto neighbor = TimelineHorizontalNeighbor(selected_item, left, &error);
+            if (neighbor && !otio::is_error(error)) {
+                SelectObject(neighbor);
+                appState.scroll_key = true;
+                appState.scroll_up_down = false;
             }
         }
 

@@ -17,7 +17,6 @@ std::optional<otio::TimeRange> Intersection(
 }
 
 struct LayoutBuilder {
-    otio::Composition* root;
     const TimelineExpansion& expansion;
     float track_height;
     float bar_height;
@@ -47,7 +46,8 @@ struct LayoutBuilder {
         auto override = expansion.find(composition);
         result.expanded = override == expansion.end() ? depth == 0 : override->second;
         if (result.expanded) {
-            float content_height = Children(composition, range, depth + 1, result.children);
+            auto offset = range.start_time() - result.source_range.start_time();
+            float content_height = Children(composition, range, offset, depth + 1, result.children);
             if (!result.children.empty()) {
                 for (auto& child : result.children)
                     child.y += result.header_height + padding;
@@ -60,15 +60,14 @@ struct LayoutBuilder {
     float Children(
         otio::Composition* composition,
         const otio::TimeRange& visible_range,
+        const otio::RationalTime& offset,
         int depth,
         std::vector<TimelineItemLayout>& items) {
         auto ranges = composition->range_of_all_children(error);
         if (otio::is_error(error))
             return 0;
-        // OTIO accounts for all intermediate source_range offsets here.
-        auto offset = composition->transformed_time(otio::RationalTime(), root, error);
-        if (otio::is_error(error))
-            return 0;
+        // The caller carries this composition's source-to-timeline offset.
+        // Walking ancestors here would rescan preceding siblings for every stack.
         bool parallel = dynamic_cast<otio::Stack*>(composition) != nullptr;
         float height = 0;
         for (auto child : TimelineChildrenInDisplayOrder(composition)) {
@@ -89,7 +88,11 @@ struct LayoutBuilder {
             // A stack's wrapping tracks are lanes, not an extra nesting level.
             if (auto track = parallel ? dynamic_cast<otio::Track*>(item) : nullptr) {
                 size_t first = items.size();
-                child_height = Children(track, *visible, depth, items);
+                auto source_start = track->trimmed_range(error).start_time();
+                if (otio::is_error(error))
+                    return 0;
+                auto child_offset = full_range.start_time() - source_start;
+                child_height = Children(track, *visible, child_offset, depth, items);
                 for (size_t i = first; i < items.size(); ++i)
                     items[i].y += y;
             } else {
@@ -123,11 +126,14 @@ TimelineTrackLayout BuildTimelineTrackLayout(
     auto range = track->trimmed_range(error);
     if (otio::is_error(error))
         return result;
-    range = track->transformed_time_range(range, timeline_tracks, error);
+    auto source_start = range.start_time();
+    auto start = track->transformed_time(source_start, timeline_tracks, error);
     if (otio::is_error(error))
         return result;
-    LayoutBuilder builder{timeline_tracks, expansion, track_height, nested_bar_height, error};
-    result.height = std::max(track_height, builder.Children(track, range, 0, result.items));
+    range = otio::TimeRange(start, range.duration());
+    LayoutBuilder builder{expansion, track_height, nested_bar_height, error};
+    result.height = std::max(track_height, builder.Children(
+        track, range, start - source_start, 0, result.items));
     if (otio::is_error(error))
         result.items.clear();
     return result;
@@ -202,4 +208,58 @@ otio::Composable* TimelineVerticalNeighbor(
     if (otio::is_error(error_status) || !next_range.contains(time))
         return nullptr;
     return next->child_at_time(time, error_status);
+}
+
+otio::Composable* TimelineHorizontalNeighbor(
+    otio::Composable* selected, bool before, otio::ErrorStatus* error_status) {
+    auto current = selected ? dynamic_cast<otio::Track*>(selected->parent()) : nullptr;
+    if (!current)
+        return nullptr;
+    otio::ErrorStatus local_error;
+    auto error = error_status ? error_status : &local_error;
+    std::optional<otio::TimeRange> visible = current->trimmed_range(error);
+    if (otio::is_error(error))
+        return nullptr;
+
+    // Project ancestor trims into this track's coordinates once per key press,
+    // then use one range map to find the next visible sibling.
+    otio::RationalTime offset;
+    for (otio::Composition* context = current; context->parent(); context = context->parent()) {
+        auto parent = context->parent();
+        auto placement = parent->range_of_child(context, error);
+        if (otio::is_error(error))
+            return nullptr;
+        auto source_start = context->trimmed_range(error).start_time();
+        if (otio::is_error(error))
+            return nullptr;
+        offset += placement.start_time() - source_start;
+        auto parent_range = parent->trimmed_range(error);
+        if (otio::is_error(error))
+            return nullptr;
+        visible = Intersection(*visible, otio::TimeRange(
+            parent_range.start_time() - offset, parent_range.duration()));
+        if (!visible)
+            return nullptr;
+    }
+
+    auto ranges = current->range_of_all_children(error);
+    if (otio::is_error(error))
+        return nullptr;
+    const auto& children = current->children();
+    auto found = std::find(children.begin(), children.end(), selected);
+    if (found == children.end())
+        return nullptr;
+    bool nested = current->parent() && current->parent()->parent();
+    int step = before ? -1 : 1;
+    for (int i = static_cast<int>(found - children.begin()) + step;
+         i >= 0 && i < static_cast<int>(children.size()); i += step) {
+        auto child = children[i].value;
+        // Nested previews show items, with gaps left as empty space.
+        if (nested && (!dynamic_cast<otio::Item*>(child) || dynamic_cast<otio::Gap*>(child)))
+            continue;
+        auto range = ranges.find(child);
+        if (range != ranges.end() && Intersection(range->second, *visible))
+            return child;
+    }
+    return nullptr;
 }
